@@ -108,6 +108,11 @@ cat > "${PROTON_CONF_DIR}/01_routing.json" <<'CEOF'
     "rules": [
       {
         "type": "field",
+        "ip": ["127.0.0.0/8", "::1/128"],
+        "outboundTag": "direct_no_proxy"
+      },
+      {
+        "type": "field",
         "protocol": ["bittorrent"],
         "outboundTag": "direct_no_proxy"
       }
