@@ -7,6 +7,11 @@ set -euo pipefail
 
 INSTALL_DIR="/etc/v2ray-agent/xray"
 CONF_DIR="${INSTALL_DIR}/conf"
+PROTON_DIR="/etc/v2ray-agent/proton"
+PROTON_CONF_DIR="/etc/v2ray-agent/xray/conf-proton"
+WIREPROXY_SOCKS_PORT=40000
+WIREPROXY_HTTP_PORT=40001
+USE_PROTON_EXIT=false
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -138,7 +143,30 @@ install_xray() {
 setup_systemd_service() {
     log_info "Setting up systemd service..."
 
-    cat > /etc/systemd/system/xray.service <<EOF
+    if [[ "${USE_PROTON_EXIT}" == "true" ]]; then
+        cat > /etc/systemd/system/xray-proton.service <<EOF
+[Unit]
+Description=Xray Service (ProtonVPN exit)
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target wireproxy.service
+Requires=wireproxy.service
+
+[Service]
+User=root
+ExecStart=${INSTALL_DIR}/xray run -confdir ${PROTON_CONF_DIR}
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=infinity
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable xray-proton.service
+        log_info "Systemd service xray-proton configured"
+    else
+        cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
 Description=Xray Service
 Documentation=https://github.com/xtls
@@ -155,10 +183,10 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable xray.service
-    log_info "Systemd service configured"
+        systemctl daemon-reload
+        systemctl enable xray.service
+        log_info "Systemd service configured"
+    fi
 }
 
 choose_reality_port() {
@@ -274,13 +302,200 @@ generate_uuid() {
     log_info "Client UUID: ${CLIENT_UUID}"
 }
 
+# ── ProtonVPN wireproxy (WireGuard exit hop) ─────────────────────
+
+install_wireproxy() {
+    if command -v wireproxy &>/dev/null; then
+        log_info "wireproxy already installed: $(which wireproxy)"
+        return
+    fi
+
+    log_info "Installing wireproxy..."
+
+    if ! command -v go &>/dev/null; then
+        log_info "Installing Go..."
+        local go_version="1.23.4"
+        local arch
+        case "$(uname -m)" in
+            'amd64'|'x86_64') arch="amd64" ;;
+            'aarch64'|'armv8') arch="arm64" ;;
+            *) log_error "Unsupported arch for Go"; exit 1 ;;
+        esac
+        wget -q "https://go.dev/dl/go${go_version}.linux-${arch}.tar.gz" -O /tmp/go.tar.gz
+        rm -rf /usr/local/go
+        tar -C /usr/local -xzf /tmp/go.tar.gz
+        rm -f /tmp/go.tar.gz
+        export PATH="/usr/local/go/bin:${PATH}"
+        export GOPATH="/root/go"
+        export PATH="${GOPATH}/bin:${PATH}"
+    fi
+
+    export GOPROXY="https://proxy.golang.org,direct"
+    go install github.com/windtf/wireproxy/cmd/wireproxy@latest
+
+    if ! command -v wireproxy &>/dev/null; then
+        local gopath="${GOPATH:-/root/go}"
+        if [[ -f "${gopath}/bin/wireproxy" ]]; then
+            ln -sf "${gopath}/bin/wireproxy" /usr/local/bin/wireproxy
+        else
+            log_error "wireproxy build failed"
+            exit 1
+        fi
+    fi
+
+    log_info "wireproxy installed: $(which wireproxy)"
+}
+
+install_proton_wg() {
+    log_info "Setting up proton_wg..."
+
+    mkdir -p "${PROTON_DIR}"
+
+    # Install Python deps
+    if ! command -v python3 &>/dev/null; then
+        ${PKG_INSTALL} python3 python3-pip
+    fi
+    python3 -m pip install -q requests[socks] pynacl bcrypt 2>/dev/null || python3 -m pip install --break-system-packages -q requests[socks] pynacl bcrypt
+
+    # Download proton_wg.py from repo
+    wget -q "https://raw.githubusercontent.com/vhp8rc7p/proton-wg-config/main/proton_wg.py" \
+        -O "${PROTON_DIR}/proton_wg.py"
+
+    if [[ ! -f "${PROTON_DIR}/proton_wg.py" ]]; then
+        log_error "Failed to download proton_wg.py"
+        exit 1
+    fi
+
+    log_info "proton_wg.py installed to ${PROTON_DIR}/"
+}
+
+setup_proton_credentials() {
+    echo
+    log_blue "============ ProtonVPN Credentials ============"
+    log_warn "These are used to authenticate with ProtonVPN API"
+    log_warn "and generate a WireGuard config for the exit hop."
+    echo
+    read -r -p "ProtonVPN username (email): " PROTON_USER
+    read -r -s -p "ProtonVPN password: " PROTON_PASS
+    echo
+
+    if [[ -z "${PROTON_USER}" || -z "${PROTON_PASS}" ]]; then
+        log_error "Credentials cannot be empty"
+        exit 1
+    fi
+}
+
+choose_proton_country() {
+    echo
+    read -r -p "ProtonVPN exit country code [NL]: " PROTON_COUNTRY
+    PROTON_COUNTRY="${PROTON_COUNTRY:-NL}"
+    log_info "ProtonVPN exit country: ${PROTON_COUNTRY}"
+}
+
+generate_proton_wg_config() {
+    log_info "Authenticating with ProtonVPN and generating WireGuard config..."
+
+    cd "${PROTON_DIR}"
+    python3 proton_wg.py -u "${PROTON_USER}" --password "${PROTON_PASS}" \
+        -c "${PROTON_COUNTRY}" -s 0
+
+    local wg_conf
+    wg_conf=$(find "${PROTON_DIR}/configs" -name "*.conf" ! -name "*.wireproxy.conf" -type f | head -1)
+
+    if [[ -z "${wg_conf}" ]]; then
+        log_error "No WireGuard config generated"
+        exit 1
+    fi
+
+    log_info "WireGuard config: ${wg_conf}"
+
+    # Generate wireproxy config from WireGuard config
+    python3 -c "
+import sys
+sys.path.insert(0, '${PROTON_DIR}')
+from proton_wg import make_wireproxy_config
+wp = make_wireproxy_config('${wg_conf}', ${WIREPROXY_SOCKS_PORT}, ${WIREPROXY_HTTP_PORT})
+print(wp)
+"
+    log_info "wireproxy config generated"
+}
+
+setup_wireproxy_service() {
+    log_info "Setting up wireproxy systemd service..."
+
+    local wp_conf
+    wp_conf=$(find "${PROTON_DIR}/configs" -name "*.wireproxy.conf" -type f | head -1)
+
+    if [[ -z "${wp_conf}" ]]; then
+        log_error "No wireproxy config found in ${PROTON_DIR}/configs/"
+        exit 1
+    fi
+
+    # Stop any running wireproxy first
+    pkill -f wireproxy 2>/dev/null || true
+    sleep 1
+
+    cat > /etc/systemd/system/wireproxy.service <<EOF
+[Unit]
+Description=wireproxy (ProtonVPN WireGuard tunnel)
+After=network.target
+Before=xray.service
+
+[Service]
+Type=simple
+ExecStart=$(which wireproxy) -c ${wp_conf}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable wireproxy.service
+    systemctl start wireproxy.service
+
+    # Wait for wireproxy tunnel to establish (WireGuard handshake takes ~6-10s)
+    log_info "Waiting for WireGuard tunnel to establish..."
+    local ready=false
+    for i in $(seq 1 15); do
+        if ! systemctl is-active wireproxy &>/dev/null; then
+            log_error "wireproxy service crashed"
+            journalctl -u wireproxy --no-pager -n 10
+            exit 1
+        fi
+        if curl -s --socks5-hostname "127.0.0.1:${WIREPROXY_SOCKS_PORT}" \
+            "https://api.ipify.org?format=json" --max-time 5 &>/dev/null; then
+            ready=true
+            break
+        fi
+        sleep 3
+    done
+
+    if ! ${ready}; then
+        log_error "wireproxy tunnel failed to establish after 45s"
+        journalctl -u wireproxy --no-pager -n 20
+        exit 1
+    fi
+
+    local exit_ip
+    exit_ip=$(curl -s --socks5-hostname "127.0.0.1:${WIREPROXY_SOCKS_PORT}" \
+        "https://api.ipify.org?format=json" --max-time 10 | jq -r '.ip' 2>/dev/null)
+    log_info "wireproxy tunnel ready — ProtonVPN exit IP: ${exit_ip}"
+}
+
 write_xray_config() {
     log_info "Writing Xray configuration..."
 
-    mkdir -p "${CONF_DIR}"
+    local target_conf="${CONF_DIR}"
+    if [[ "${USE_PROTON_EXIT}" == "true" ]]; then
+        target_conf="${PROTON_CONF_DIR}"
+    fi
+
+    mkdir -p "${target_conf}"
 
     # Base outbound config
-    cat > "${CONF_DIR}/00_log.json" <<'EOF'
+    cat > "${target_conf}/00_log.json" <<'EOF'
 {
   "log": {
     "error": "/etc/v2ray-agent/xray/error.log",
@@ -289,7 +504,23 @@ write_xray_config() {
 }
 EOF
 
-    cat > "${CONF_DIR}/01_routing.json" <<'EOF'
+    if [[ "${USE_PROTON_EXIT}" == "true" ]]; then
+        cat > "${target_conf}/01_routing.json" <<'EOF'
+{
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "protocol": ["bittorrent"],
+        "outboundTag": "direct_no_proxy"
+      }
+    ]
+  }
+}
+EOF
+    else
+        cat > "${target_conf}/01_routing.json" <<'EOF'
 {
   "routing": {
     "domainStrategy": "AsIs",
@@ -303,8 +534,39 @@ EOF
   }
 }
 EOF
+    fi
 
-    cat > "${CONF_DIR}/02_outbound.json" <<'EOF'
+    if [[ "${USE_PROTON_EXIT}" == "true" ]]; then
+        cat > "${target_conf}/02_outbound.json" <<EOF
+{
+  "outbounds": [
+    {
+      "protocol": "socks",
+      "settings": {
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": ${WIREPROXY_SOCKS_PORT}
+          }
+        ]
+      },
+      "tag": "z_direct_outbound"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {},
+      "tag": "direct_no_proxy"
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {},
+      "tag": "blackhole_out"
+    }
+  ]
+}
+EOF
+    else
+        cat > "${target_conf}/02_outbound.json" <<'EOF'
 {
   "outbounds": [
     {
@@ -320,9 +582,15 @@ EOF
   ]
 }
 EOF
+    fi
 
-    # Reality inbound config
-    cat > "${CONF_DIR}/07_VLESS_vision_reality_inbounds.json" <<EOF
+    # Reality inbound config — use different internal port to avoid conflict
+    local internal_port=45987
+    if [[ "${USE_PROTON_EXIT}" == "true" ]]; then
+        internal_port=45988
+    fi
+
+    cat > "${target_conf}/07_VLESS_vision_reality_inbounds.json" <<EOF
 {
   "inbounds": [
     {
@@ -331,7 +599,7 @@ EOF
       "protocol": "dokodemo-door",
       "settings": {
         "address": "127.0.0.1",
-        "port": 45987,
+        "port": ${internal_port},
         "network": "tcp"
       },
       "sniffing": {
@@ -342,7 +610,7 @@ EOF
     },
     {
       "listen": "127.0.0.1",
-      "port": 45987,
+      "port": ${internal_port},
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -394,20 +662,25 @@ EOF
 }
 EOF
 
-    log_info "Configuration written to ${CONF_DIR}/"
+    log_info "Configuration written to ${target_conf}/"
 }
 
 start_xray() {
-    log_info "Starting Xray..."
-    systemctl stop xray 2>/dev/null || true
-    systemctl start xray
+    local svc="xray"
+    if [[ "${USE_PROTON_EXIT}" == "true" ]]; then
+        svc="xray-proton"
+    fi
+
+    log_info "Starting ${svc}..."
+    systemctl stop "${svc}" 2>/dev/null || true
+    systemctl start "${svc}"
 
     sleep 1
-    if pgrep -f "xray" >/dev/null; then
-        log_info "Xray started successfully"
+    if systemctl is-active "${svc}" &>/dev/null; then
+        log_info "${svc} started successfully"
     else
-        log_error "Xray failed to start — check logs:"
-        log_error "  journalctl -u xray --no-pager -n 20"
+        log_error "${svc} failed to start — check logs:"
+        log_error "  journalctl -u ${svc} --no-pager -n 20"
         exit 1
     fi
 }
@@ -421,7 +694,15 @@ show_client_info() {
     log_blue "                  Reality Deployment Complete"
     log_blue "================================================================"
     echo
-    log_info "Protocol:    VLESS + Reality + Vision"
+    if [[ "${USE_PROTON_EXIT}" == "true" ]]; then
+        local proton_ip
+        proton_ip=$(curl -s --socks5-hostname "127.0.0.1:${WIREPROXY_SOCKS_PORT}" \
+            "https://api.ipify.org?format=json" --max-time 10 | jq -r '.ip' 2>/dev/null)
+        log_info "Mode:        VLESS + Reality + Vision → ProtonVPN (${PROTON_COUNTRY})"
+        log_info "Exit IP:     ${proton_ip} (ProtonVPN, NOT server IP)"
+    else
+        log_info "Protocol:    VLESS + Reality + Vision"
+    fi
     log_info "Server:      ${public_ip}"
     log_info "Port:        ${REALITY_PORT}"
     log_info "UUID:        ${CLIENT_UUID}"
@@ -436,11 +717,16 @@ show_client_info() {
     fi
     echo
 
-    local share_link="vless://${CLIENT_UUID}@${public_ip}:${REALITY_PORT}?encryption=none&security=reality&type=tcp&sni=${REALITY_SERVER_NAME}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision"
+    local share_link="vless://${CLIENT_UUID}@${public_ip}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER_NAME}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=6ba85179e30d4fc2&spx=%2F&type=tcp&headerType=none"
     if [[ -n "${MLDSA65_VERIFY}" ]]; then
         share_link="${share_link}&pqv=${MLDSA65_VERIFY}"
     fi
-    share_link="${share_link}#VLESS-Reality"
+    # Remark name URL-encoded — some clients reject special chars in fragment
+    local remark="VLESSReality"
+    if [[ "${USE_PROTON_EXIT}" == "true" ]]; then
+        remark="VLESSReality${PROTON_COUNTRY}Proton"
+    fi
+    share_link="${share_link}#${remark}"
 
     log_blue "Share link (VLESS):"
     echo -e "${GREEN}${share_link}${RESET}"
@@ -468,16 +754,52 @@ EOF
 }
 
 uninstall() {
-    log_warn "This will remove Xray and all configuration"
-    read -r -p "Continue? [y/n]: " confirm
-    if [[ "${confirm}" != "y" ]]; then
-        return
-    fi
-    systemctl stop xray 2>/dev/null || true
-    systemctl disable xray 2>/dev/null || true
-    rm -f /etc/systemd/system/xray.service
-    systemctl daemon-reload
-    rm -rf /etc/v2ray-agent
+    echo
+    log_blue "What to uninstall?"
+    log_blue "  a. Everything (xray + xray-proton + wireproxy)"
+    log_blue "  b. Only ProtonVPN exit (xray-proton + wireproxy)"
+    log_blue "  c. Only direct Reality (xray)"
+    echo
+    read -r -p "Select [a/b/c]: " unsub
+    case "${unsub}" in
+        a)
+            log_warn "This will remove ALL Xray instances, wireproxy, and /etc/v2ray-agent"
+            read -r -p "Continue? [y/n]: " confirm
+            [[ "${confirm}" != "y" ]] && return
+            systemctl stop xray 2>/dev/null || true
+            systemctl disable xray 2>/dev/null || true
+            systemctl stop xray-proton 2>/dev/null || true
+            systemctl disable xray-proton 2>/dev/null || true
+            systemctl stop wireproxy 2>/dev/null || true
+            systemctl disable wireproxy 2>/dev/null || true
+            rm -f /etc/systemd/system/xray.service
+            rm -f /etc/systemd/system/xray-proton.service
+            rm -f /etc/systemd/system/wireproxy.service
+            systemctl daemon-reload
+            rm -rf /etc/v2ray-agent
+            ;;
+        b)
+            systemctl stop xray-proton 2>/dev/null || true
+            systemctl disable xray-proton 2>/dev/null || true
+            systemctl stop wireproxy 2>/dev/null || true
+            systemctl disable wireproxy 2>/dev/null || true
+            rm -f /etc/systemd/system/xray-proton.service
+            rm -f /etc/systemd/system/wireproxy.service
+            systemctl daemon-reload
+            rm -rf "${PROTON_CONF_DIR}" "${PROTON_DIR}"
+            ;;
+        c)
+            systemctl stop xray 2>/dev/null || true
+            systemctl disable xray 2>/dev/null || true
+            rm -f /etc/systemd/system/xray.service
+            systemctl daemon-reload
+            rm -rf "${CONF_DIR}"
+            ;;
+        *)
+            log_error "Invalid selection"
+            return
+            ;;
+    esac
     log_info "Uninstalled"
 }
 
@@ -488,9 +810,10 @@ main() {
     log_blue "============================================"
     echo
     log_blue "1. Install VLESS + Reality + Vision"
-    log_blue "2. Uninstall"
+    log_blue "2. Install VLESS + Reality + Vision (ProtonVPN exit)"
+    log_blue "3. Uninstall"
     echo
-    read -r -p "Select [1/2]: " action
+    read -r -p "Select [1/2/3]: " action
 
     case "${action}" in
         1)
@@ -512,6 +835,35 @@ main() {
             show_client_info
             ;;
         2)
+            USE_PROTON_EXIT=true
+            check_root
+            check_os
+            detect_arch
+            detect_package_manager
+            install_dependencies
+            install_xray
+            setup_systemd_service
+
+            # ProtonVPN wireproxy setup
+            install_wireproxy
+            install_proton_wg
+            setup_proton_credentials
+            choose_proton_country
+            generate_proton_wg_config
+            setup_wireproxy_service
+
+            # Reality setup
+            choose_reality_port
+            open_firewall_port
+            choose_target_domain
+            generate_keys
+            generate_mldsa65
+            generate_uuid
+            write_xray_config
+            start_xray
+            show_client_info
+            ;;
+        3)
             check_root
             uninstall
             ;;
