@@ -7,8 +7,8 @@ set -euo pipefail
 WIREPROXY_CONF="/root/proton-wg-config/configs/NL-FREE79.wireproxy.conf"
 WIREPROXY_BIN="/root/go/bin/wireproxy"
 WIREPROXY_SOCKS_PORT=40000
-XRAY_BIN="/etc/v2ray-agent/xray/xray"
-PROTON_CONF_DIR="/etc/v2ray-agent/xray/conf-proton"
+XRAY_BIN="/etc/xray-reality/xray"
+PROTON_CONF_DIR="/etc/xray-reality/conf-proton"
 
 GREEN='\033[32m'
 RED='\033[31m'
@@ -95,7 +95,7 @@ mkdir -p "${PROTON_CONF_DIR}"
 cat > "${PROTON_CONF_DIR}/00_log.json" <<'CEOF'
 {
   "log": {
-    "error": "/etc/v2ray-agent/xray/error-proton.log",
+    "error": "/etc/xray-reality/error-proton.log",
     "loglevel": "warning"
   }
 }

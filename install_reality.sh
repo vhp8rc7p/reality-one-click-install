@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 
 # Standalone Xray Reality Deployment Script
-# Extracted from v2ray-agent — deploys VLESS + Reality + Vision (no domain required)
+# Deploys VLESS + Reality + Vision (no domain required)
 
 set -euo pipefail
 
-INSTALL_DIR="/etc/v2ray-agent/xray"
+INSTALL_DIR="/etc/xray-reality"
 CONF_DIR="${INSTALL_DIR}/conf"
-PROTON_DIR="/etc/v2ray-agent/proton"
-PROTON_CONF_DIR="/etc/v2ray-agent/xray/conf-proton"
+PROTON_DIR="${INSTALL_DIR}/proton"
+PROTON_CONF_DIR="${INSTALL_DIR}/conf-proton"
 WIREPROXY_SOCKS_PORT=40000
 WIREPROXY_HTTP_PORT=40001
 USE_PROTON_EXIT=false
@@ -498,7 +498,7 @@ write_xray_config() {
     cat > "${target_conf}/00_log.json" <<'EOF'
 {
   "log": {
-    "error": "/etc/v2ray-agent/xray/error.log",
+    "error": "/etc/xray-reality/error.log",
     "loglevel": "warning"
   }
 }
@@ -763,7 +763,7 @@ uninstall() {
     read -r -p "Select [a/b/c]: " unsub
     case "${unsub}" in
         a)
-            log_warn "This will remove ALL Xray instances, wireproxy, and /etc/v2ray-agent"
+            log_warn "This will remove ALL Xray instances, wireproxy, and /etc/xray-reality"
             read -r -p "Continue? [y/n]: " confirm
             [[ "${confirm}" != "y" ]] && return
             systemctl stop xray 2>/dev/null || true
@@ -776,7 +776,7 @@ uninstall() {
             rm -f /etc/systemd/system/xray-proton.service
             rm -f /etc/systemd/system/wireproxy.service
             systemctl daemon-reload
-            rm -rf /etc/v2ray-agent
+            rm -rf /etc/xray-reality
             ;;
         b)
             systemctl stop xray-proton 2>/dev/null || true
